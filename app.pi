@@ -1,0 +1,111 @@
+"""
+Line Tester 1013 — backend
+A small Flask service that fronts the Twilio Voice API so the browser
+client (static/) can:
+  1. Get a short-lived Access Token to run the Twilio Voice JS SDK.
+  2. Receive TwiML instructions for outbound test calls (dial-out to a
+     real PSTN number, or play a reference test tone down the line).
+
+Real-time quality metrics (MOS, jitter, RTT, packet loss, codec) are
+NOT computed here — they come straight from the Voice JS SDK's
+`sample` event in the browser (see static/js/app.js). This backend's
+job is just: mint tokens, and tell Twilio what to do with a call.
+
+Env vars required (see .env.example):
+  TWILIO_ACCOUNT_SID
+  TWILIO_API_KEY_SID
+  TWILIO_API_KEY_SECRET
+  TWILIO_TWIML_APP_SID
+  TWILIO_CALLER_ID        (a Twilio number you own, E.164)
+"""
+import os
+from flask import Flask, request, Response, jsonify, send_from_directory
+from twilio.jwt.access_token import AccessToken
+from twilio.jwt.access_token.grants import VoiceGrant
+from twilio.twiml.voice_response import VoiceResponse, Dial
+
+from dotenv import load_dotenv
+load_dotenv()
+
+app = Flask(__name__, static_folder="static", static_url_path="")
+
+ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+API_KEY_SID = os.environ.get("TWILIO_API_KEY_SID")
+API_KEY_SECRET = os.environ.get("TWILIO_API_KEY_SECRET")
+TWIML_APP_SID = os.environ.get("TWILIO_TWIML_APP_SID")
+CALLER_ID = os.environ.get("TWILIO_CALLER_ID")
+
+# Reference tones a technician can play down a live line and listen to
+# on the far end, same idea as the tone a POTS test set injects.
+# 1004 Hz is the classic North American telco test-tone frequency.
+TEST_TONES = {
+    "1004": "https://demo.twilio.com/docs/1004hz.wav",  # standard 1004 Hz reference tone
+}
+
+
+@app.route("/")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/token")
+def token():
+    """Issue a Voice Grant access token so the browser can register as
+    a softphone client and place calls through the TwiML App below."""
+    missing = [
+        name
+        for name, val in (
+            ("TWILIO_ACCOUNT_SID", ACCOUNT_SID),
+            ("TWILIO_API_KEY_SID", API_KEY_SID),
+            ("TWILIO_API_KEY_SECRET", API_KEY_SECRET),
+            ("TWILIO_TWIML_APP_SID", TWIML_APP_SID),
+        )
+        if not val
+    ]
+    if missing:
+        return jsonify(error=f"Missing env vars: {', '.join(missing)}"), 500
+
+    identity = request.args.get("identity", "tester")
+    voice_grant = VoiceGrant(
+        outgoing_application_sid=TWIML_APP_SID,
+        incoming_allow=True,
+    )
+    access_token = AccessToken(
+        ACCOUNT_SID, API_KEY_SID, API_KEY_SECRET, identity=identity
+    )
+    access_token.add_grant(voice_grant)
+    return jsonify(token=access_token.to_jwt(), identity=identity)
+
+
+@app.route("/voice", methods=["POST"])
+def voice():
+    """TwiML App Voice URL. Twilio POSTs here when the browser client
+    places a call. Two modes, chosen by the client:
+      - mode=dial  -> bridges to a real PSTN number (live quality test)
+      - mode=tone  -> plays a reference test tone back to the browser
+                      (loopback listening test, no PSTN leg)
+    """
+    mode = request.values.get("mode", "dial")
+    resp = VoiceResponse()
+
+    if mode == "tone":
+        tone_key = request.values.get("tone", "1004")
+        resp.say("Reference tone test. One kilohertz, four hertz.", voice="alice")
+        resp.play(TEST_TONES.get(tone_key, TEST_TONES["1004"]), loop=10)
+        return Response(str(resp), mimetype="text/xml")
+
+    # mode == "dial": ring a real phone number so the SDK can measure
+    # the call quality Twilio's edge sees for that leg.
+    number = request.values.get("To")
+    if not number:
+        resp.say("No destination number was provided.")
+        return Response(str(resp), mimetype="text/xml")
+
+    dial = Dial(caller_id=CALLER_ID, answer_on_bridge=True)
+    dial.number(number)
+    resp.append(dial)
+    return Response(str(resp), mimetype="text/xml")
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
